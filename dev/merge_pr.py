@@ -65,6 +65,7 @@ GITHUB_OAUTH_KEY = os.environ.get("GITHUB_OAUTH_KEY")
 
 
 GITHUB_BASE = "https://github.com/apache/celeborn/pull"
+GITHUB_COMMIT_BASE = "https://github.com/apache/celeborn/commit"
 GITHUB_API_BASE = "https://api.github.com/repos/apache/celeborn"
 JIRA_BASE = "https://issues.apache.org/jira/browse"
 JIRA_API_BASE = "https://issues.apache.org/jira"
@@ -88,6 +89,44 @@ def get_json(url):
         else:
             print("Unable to fetch URL, exiting: %s" % url)
         sys.exit(-1)
+
+
+def comment_pr(pr_num, body):
+    url = "%s/issues/%s/comments" % (GITHUB_API_BASE, pr_num)
+    data = json.dumps({"body": body}).encode("utf-8")
+    request = Request(url, data=data, method="POST")
+    request.add_header("Content-Type", "application/json")
+    request.add_header("Accept", "application/vnd.github+json")
+    if GITHUB_OAUTH_KEY:
+        request.add_header("Authorization", "token %s" % GITHUB_OAUTH_KEY)
+    try:
+        return json.load(urlopen(request))
+    except HTTPError as e:
+        print("Failed to comment on PR #%s: HTTP %s %s" % (pr_num, e.code, e.reason))
+        return None
+
+
+def post_merge_comment(pr_num, merged_commits):
+    """Post a comment on the PR recording every branch the change landed on and a
+    link to the resulting commit, so the merge is traceable from the PR page.
+
+    ``merged_commits`` is an ordered list of (branch, commit hash) pairs, the merge
+    sink first followed by each cherry-pick target.
+    """
+    if not merged_commits:
+        return
+    lines = [
+        "- merged into %s %s/%s" % (ref, GITHUB_COMMIT_BASE, commit_hash)
+        for ref, commit_hash in merged_commits
+    ]
+    summary = "**Merge Summary:**\n" + "\n".join(lines)
+    attribution = "*Posted by `merge_pr.py`*"
+    body = "%s\n\n%s" % (summary, attribution)
+    print("\nPosting merge comment on PR #%s:\n\n%s\n%s" % (pr_num, summary, attribution))
+    if not GITHUB_OAUTH_KEY:
+        print("GITHUB_OAUTH_KEY is not set; skipping the merge comment.")
+        return
+    comment_pr(pr_num, body)
 
 
 def fail(msg):
@@ -206,6 +245,8 @@ def merge_pr(pr_num, target_ref, title, body, pr_repo_desc):
     return merge_hash
 
 
+# cherry-pick the merge commit into the requested branch and return the
+# (pushed ref, pushed commit hash) pair
 def cherry_pick(pr_num, merge_hash, default_branch):
     pick_ref = input("Enter a branch name [%s]: " % default_branch)
     if pick_ref == "":
@@ -239,7 +280,7 @@ def cherry_pick(pr_num, merge_hash, default_branch):
 
     print("Pull request #%s picked into %s!" % (pr_num, pick_ref))
     print("Pick hash: %s" % pick_hash)
-    return pick_ref
+    return pick_ref, pick_hash
 
 
 def _semver_max_version(names):
@@ -616,7 +657,8 @@ def main():
             fail("Couldn't find any merge commit for #%s, you may need to update HEAD." % pr_num)
 
         print("Found commit %s:\n%s" % (merge_hash, message))
-        cherry_pick(pr_num, merge_hash, next(branch_iter, branch_names[0]))
+        picked = cherry_pick(pr_num, merge_hash, next(branch_iter, branch_names[0]))
+        post_merge_comment(pr_num, [picked])
         sys.exit(0)
 
     if not bool(pr["mergeable"]):
@@ -634,11 +676,20 @@ def main():
 
     merge_hash = merge_pr(pr_num, target_ref, title, body, pr_repo_desc)
 
+    # Ordered (branch, commit hash) pairs for the merge comment: the merge sink first,
+    # then each cherry-pick target as it is picked.
+    merged_commits = [(target_ref, merge_hash)]
+
     pick_prompt = "Would you like to pick %s into another branch?" % merge_hash
-    while input("\n%s (y/n): " % pick_prompt).lower() == "y":
-        merged_refs = merged_refs + [
-            cherry_pick(pr_num, merge_hash, next(branch_iter, branch_names[0]))
-        ]
+    # Post the summary in a finally block: the merge into the target branch has already
+    # been pushed, so aborting a later cherry-pick must not drop that line.
+    try:
+        while input("\n%s (y/n): " % pick_prompt).lower() == "y":
+            picked = cherry_pick(pr_num, merge_hash, next(branch_iter, branch_names[0]))
+            merged_refs = merged_refs + [picked[0]]
+            merged_commits = merged_commits + [picked]
+    finally:
+        post_merge_comment(pr_num, merged_commits)
 
     if asf_jira is not None:
         continue_maybe("Would you like to update an associated JIRA?")
