@@ -159,7 +159,7 @@ def run_cmd(cmd):
 
 
 def continue_maybe(prompt):
-    result = input("\n%s (y/n): " % prompt)
+    result = input("\n%s (y/N): " % prompt)
     if result.lower() != "y":
         fail("Okay, exiting")
 
@@ -446,7 +446,7 @@ def choose_jira_assignee(issue):
                     annotations.append("Commentor")
                 print("[%d] %s (%s)" % (idx, author.displayName, ",".join(annotations)))
             raw_assignee = input(
-                "Enter number of user, or userid, to assign to (blank to leave unassigned):"
+                "Enter number of user, or userid, to assign to (blank to leave unassigned): "
             )
             if raw_assignee == "":
                 return None
@@ -619,7 +619,7 @@ def main():
         print("I've re-written the title as follows to match the standard format:")
         print("Original: %s" % pr["title"])
         print("Modified: %s" % modified_title)
-        result = input("Would you like to use the modified title? (y/n): ")
+        result = input("Would you like to use the modified title? (y/N): ")
         if result.lower() == "y":
             title = modified_title
             print("Using modified title:")
@@ -639,7 +639,7 @@ def main():
         print(modified_body)
         print("=" * 80)
         print("I've removed the comments from PR template like the above:")
-        result = input("Would you like to use the modified body? (y/n): ")
+        result = input("Would you like to use the modified body? (y/N): ")
         if result.lower() == "y":
             body = modified_body
             print("Using modified body:")
@@ -699,7 +699,7 @@ def main():
     # Post the summary in a finally block: the merge into the target branch has already
     # been pushed, so aborting a later cherry-pick must not drop that line.
     try:
-        while input("\n%s (y/n): " % pick_prompt).lower() == "y":
+        while input("\n%s (y/N): " % pick_prompt).lower() == "y":
             picked = cherry_pick(pr_num, merge_hash, next(branch_iter, branch_names[0]))
             merged_refs = merged_refs + [picked[0]]
             merged_commits = merged_commits + [picked]
