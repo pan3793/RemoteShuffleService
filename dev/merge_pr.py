@@ -58,8 +58,8 @@ ASF_PASSWORD = os.environ.get("ASF_PASSWORD", "")
 # your own token management.
 JIRA_ACCESS_TOKEN = os.environ.get("JIRA_ACCESS_TOKEN")
 # OAuth key used for issuing requests against the GitHub API. If this is not defined, then requests
-# will be unauthenticated. You should only need to configure this if you find yourself regularly
-# exceeding your IP's unauthenticated request rate limit. You can create an OAuth key at
+# will be unauthenticated, so the merge summary comment is skipped and backport pull requests are
+# left open. You can create an OAuth key at
 # https://github.com/settings/tokens. This script only requires the "public_repo" scope.
 GITHUB_OAUTH_KEY = os.environ.get("GITHUB_OAUTH_KEY")
 
@@ -101,6 +101,9 @@ def get_json(url):
 
 
 def close_pr(pr_num):
+    if not GITHUB_OAUTH_KEY:
+        print("GITHUB_OAUTH_KEY is not set; skipping closing PR #%s." % pr_num)
+        return None
     url = "%s/pulls/%s" % (GITHUB_API_BASE, pr_num)
     data = json.dumps({"state": "closed"}).encode("utf-8")
     request = Request(url, data=data, method="PATCH")
@@ -110,8 +113,8 @@ def close_pr(pr_num):
         request.add_header("Authorization", "token %s" % GITHUB_OAUTH_KEY)
     try:
         return json.load(urlopen(request))
-    except HTTPError as e:
-        print("Failed to close PR #%s: HTTP %s %s" % (pr_num, e.code, e.reason))
+    except Exception as e:
+        print("Failed to close PR #%s: %s" % (pr_num, e))
         return None
 
 
@@ -125,8 +128,8 @@ def comment_pr(pr_num, body):
         request.add_header("Authorization", "token %s" % GITHUB_OAUTH_KEY)
     try:
         return json.load(urlopen(request))
-    except HTTPError as e:
-        print("Failed to comment on PR #%s: HTTP %s %s" % (pr_num, e.code, e.reason))
+    except Exception as e:
+        print("Failed to comment on PR #%s: %s" % (pr_num, e))
         return None
 
 
@@ -769,14 +772,17 @@ def main():
             merged_refs = merged_refs + [picked[0]]
             merged_commits = merged_commits + [picked]
     finally:
-        # The "Closes #N" string in the commit message only auto-closes the PR when the
-        # commit lands on the default branch. For merges into other branches (e.g.
-        # branch-X.Y backport PRs), GitHub leaves the PR open, so close it through the API.
-        pr_state = get_json("%s/pulls/%s" % (GITHUB_API_BASE, pr_num)).get("state")
-        if pr_state != "closed":
-            print("\nPR #%s is still open after push; closing it explicitly.\n" % pr_num)
-            close_pr(pr_num)
+        # Record what landed first: the merge has already been pushed, so nothing here
+        # may abort the remaining bookkeeping.
         post_merge_comment(pr_num, merged_commits)
+        # The "Closes #N" string in the commit message auto-closes the PR only when the
+        # commit lands on the default branch, so close pull requests against other
+        # branches through the API. Merges into main are left to GitHub: closing them
+        # here would race its auto-close and replace the commit-linked close event that
+        # find_merge_commit prefers.
+        if target_ref != DEFAULT_BRANCH:
+            print("\nGitHub does not auto-close PRs targeting %s; closing it.\n" % target_ref)
+            close_pr(pr_num)
 
     if asf_jira is not None:
         continue_maybe("Would you like to update an associated JIRA?")
