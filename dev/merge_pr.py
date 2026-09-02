@@ -71,6 +71,15 @@ JIRA_BASE = "https://issues.apache.org/jira/browse"
 JIRA_API_BASE = "https://issues.apache.org/jira"
 # Prefix added to temporary branches
 BRANCH_PREFIX = "PR_TOOL"
+# Branch that GitHub honors the "Closes #N" string on
+DEFAULT_BRANCH = "main"
+
+# The footer merge_pr generates: a "Closes #<pr> from <ref>" line alone on its paragraph,
+# followed by the authors paragraph. Requiring both rejects prose that merely mentions a PR.
+MERGE_FOOTER_RE = re.compile(
+    r"^Closes #(\d+) from \S+\s*$\n\n(?:Lead-authored-by|Authored-by):",
+    re.MULTILINE,
+)
 
 
 def get_json(url):
@@ -142,6 +151,69 @@ def post_merge_comment(pr_num, merged_commits):
         print("GITHUB_OAUTH_KEY is not set; skipping the merge comment.")
         return
     comment_pr(pr_num, body)
+
+
+def has_merge_footer(message, pr_num):
+    """Whether `message` carries the merge footer that `merge_pr` generates for `pr_num`.
+
+    Reads the last "Closes" paragraph, since a body quoting another PR's footer may hold an
+    earlier one. `pr_num` may be an int or a string of digits: callers read it from argv or
+    from the GitHub API, and comparing those two forms directly would never match.
+
+    >>> footer = "Closes #1 from a/b.\\n\\nAuthored-by: A <a@e.org>"
+    >>> has_merge_footer("[CELEBORN-1] Title\\n\\n" + footer, 1)
+    True
+    >>> has_merge_footer("[CELEBORN-1] Title\\n\\n" + footer, "1")
+    True
+    >>> has_merge_footer("[CELEBORN-1] Title\\n\\n" + footer, 2)
+    False
+    >>> has_merge_footer("[CELEBORN-1] Title\\n\\nSee #1 for details.", 1)
+    False
+
+    A cherry-pick keeps the footer, with `-x` provenance appended after it:
+
+    >>> pick = footer + "\\n(cherry picked from commit abc1234)"
+    >>> has_merge_footer("[CELEBORN-1] Title\\n\\n" + pick, 1)
+    True
+
+    A body quoting another PR's complete footer does not shadow the real one:
+
+    >>> quoted = "Reverting:\\n\\n" + footer + "\\n\\nSee above."
+    >>> own = footer.replace("#1", "#2")
+    >>> has_merge_footer("[CELEBORN-2] Later\\n\\n%s\\n\\n%s" % (quoted, own), 1)
+    False
+    """
+    matches = MERGE_FOOTER_RE.findall(message)
+    return bool(matches) and matches[-1] == str(pr_num)
+
+
+def find_merge_commit(pr_num, pr_events):
+    """Return the (hash, message) of the commit that merged `pr_num`, or (None, None).
+
+    Merged pull requests don't appear as merged in the GitHub API; instead, they're closed
+    by committers. GitHub attributes a commit to the `closed` event only when that commit
+    lands on the default branch, because the "Closes #N" string in the commit message is
+    what closes the PR and it is honored only there. A pull request merged into branch-x.y
+    is closed without a commit, so fall back to `referenced` events, which are also raised
+    by any commit merely mentioning the PR; confirm each against the merge footer.
+    """
+
+    def commits_of(event_name):
+        matched = [e for e in pr_events if e["event"] == event_name and e["commit_id"] is not None]
+        return [e["commit_id"] for e in sorted(matched, key=lambda x: x["created_at"])]
+
+    def message_of(commit_hash):
+        return get_json("%s/commits/%s" % (GITHUB_API_BASE, commit_hash))["commit"]["message"]
+
+    closed_commits = commits_of("closed")
+    if closed_commits:
+        return closed_commits[-1], message_of(closed_commits[-1])
+
+    for commit_hash in reversed(commits_of("referenced")):
+        message = message_of(commit_hash)
+        if has_merge_footer(message, pr_num):
+            return commit_hash, message
+    return None, None
 
 
 def fail(msg):
@@ -317,7 +389,7 @@ def compute_default_fix_versions(merge_branches, unreleased_version_names):
     """
     default_fix_versions = []
     for b in merge_branches:
-        if b == "main":
+        if b == DEFAULT_BRANCH:
             chosen = _semver_max_version(
                 [n for n in unreleased_version_names if re.fullmatch(r"\d+\.0\.0", n)]
             )
@@ -653,16 +725,9 @@ def main():
     base_ref = pr["head"]["ref"]
     pr_repo_desc = "%s/%s" % (user_login, base_ref)
 
-    # Merged pull requests don't appear as merged in the GitHub API;
-    # Instead, they're closed by committers.
-    merge_commits = [
-        e for e in pr_events if e["event"] == "closed" and e["commit_id"] is not None
-    ]
+    merge_hash, message = find_merge_commit(pr_num, pr_events)
 
-    if merge_commits:
-        merge_hash = merge_commits[0]["commit_id"]
-        message = get_json("%s/commits/%s" % (GITHUB_API_BASE, merge_hash))["commit"]["message"]
-
+    if merge_hash is not None:
         print("Pull request %s has already been merged, assuming you want to backport" % pr_num)
         commit_is_downloaded = (
             run_cmd(["git", "rev-parse", "--quiet", "--verify", "%s^{commit}" % merge_hash]).strip()
